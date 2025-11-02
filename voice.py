@@ -16,11 +16,48 @@ def speak(text):
     engine.say(text)
     engine.runAndWait()
 
-# --- Robust JSON Parsing ---
+# --- Helper: Detect file extension from code ---
+def detect_extension(code):
+    if "<html>" in code or "<body>" in code:
+        return "html"
+    elif "import " in code or "def " in code:
+        return "py"
+    elif "class " in code and "public static void main" in code:
+        return "java"
+    elif "function " in code or "console.log" in code:
+        return "js"
+    elif re.search(r"\{[\s\S]*\}", code) and not "<html>" in code:
+        return "css"
+    else:
+        return "txt"
+
+# --- 🆕 Smart code generation with auto-detection ---
+def generate_code(prompt_text):
+    """Ask Llama to generate complete multi-language code when needed."""
+    code_prompt = f"""
+The user said: "{prompt_text}"
+
+Your task:
+- Generate the full working code.
+- If it's a web project, include HTML, CSS, and JavaScript in one file.
+- If it's a backend or script, write full code with imports.
+- If it's multi-file, combine everything in one file logically.
+- Output ONLY code, no explanation, no markdown fences.
+"""
+    try:
+        response = ollama.chat(model="llama3.2", messages=[{"role": "user", "content": code_prompt}])
+        code = response.get("message", {}).get("content", "").strip()
+        print("💻 Generated Code:\n", code[:500], "...\n")
+        return code
+    except Exception as e:
+        print("⚠️ Code generation error:", e)
+        return None
+
+# --- 🆕 Enhanced intent extraction (more flexible) ---
 def parse_intent_locally(text):
     prompt = f"""
 You are an intent extraction assistant.
-Given a user command, return ONLY a JSON object.
+Analyze this command and return ONLY valid JSON.
 
 Supported intents:
 - open_app(app)
@@ -30,69 +67,67 @@ Supported intents:
 - volume_down()
 - type(text)
 - run_command(cmd)
+- write_code(description)
 
-User command: "{text}"
-Output ONLY valid JSON (no explanation).
-Example:
-{{"intent": "open_app", "params": {{"app": "chrome"}}}}
+User said: "{text}"
+
+If the user is asking to create, write, design, or build something, use:
+{{"intent": "write_code", "params": {{"description": "<full user request>"}}}}
+
+Return ONLY valid JSON.
 """
     response = ollama.chat(model="llama3.2", messages=[{"role": "user", "content": prompt}])
     content = response.get('message', {}).get('content', '').strip()
-
-    # Extract valid JSON even if extra text appears
     json_match = re.search(r'\{.*\}', content, re.DOTALL)
     if not json_match:
-        print("⚠️ Raw model output (no JSON found):", content)
         return {"intent": "unknown", "params": {}}
 
     try:
-        return json.loads(json_match.group())
-    except json.JSONDecodeError:
-        print("⚠️ JSON decode failed. Raw output:", content)
+        data = json.loads(json_match.group())
+        # 🩵 Fix: wrap 'description' in params if missing
+        if data.get("intent") == "write_code" and "params" not in data:
+            desc = data.get("description") or text
+            data = {"intent": "write_code", "params": {"description": desc}}
+        return data
+    except:
         return {"intent": "unknown", "params": {}}
 
-# --- Smarter Open App Function ---
+
+# --- Open App ---
 def open_app(app_name):
     if not app_name:
         speak("I didn’t catch the app name.")
         return
-
     app_name = app_name.lower()
-    print(f"🟢 Attempting to open {app_name}...")
-
     try:
         if SYSTEM == "windows":
-            # Try the start command (works for Chrome, Notepad, Edge, etc.)
             subprocess.run(f'start {app_name}', shell=True)
-            speak(f"Opening {app_name}")
-            return
-        elif SYSTEM == "darwin":  # macOS
+        elif SYSTEM == "darwin":
             subprocess.Popen(["open", "-a", app_name])
-            speak(f"Opening {app_name}")
-            return
-        else:  # Linux
+        else:
             subprocess.Popen([app_name])
-            speak(f"Opening {app_name}")
-            return
+        speak(f"Opening {app_name}")
     except Exception as e:
-        print(f"⚠️ Start command failed: {e}")
+        print("⚠️ Could not open app:", e)
+        speak(f"Sorry, I couldn’t open {app_name}.")
 
-    # Fallback: Search manually for the .exe in common folders
-    if SYSTEM == "windows":
-        search_dirs = [
-            r"C:\Program Files",
-            r"C:\Program Files (x86)",
-            os.path.expanduser(r"~\AppData\Local\Programs")
-        ]
-        for root_dir in search_dirs:
-            for root, dirs, files in os.walk(root_dir):
-                for file in files:
-                    if app_name in file.lower() and file.endswith(".exe"):
-                        app_path = os.path.join(root, file)
-                        subprocess.Popen(app_path)
-                        speak(f"Opening {app_name}")
-                        return
-    speak(f"Sorry, I couldn’t find {app_name} on your system.")
+# --- 🆕 Save code to file and open ---
+def save_code_to_file(code, description):
+    ext = detect_extension(code)
+    safe_name = re.sub(r'[^a-zA-Z0-9]', '_', description.strip().lower())[:30]
+    filename = f"{safe_name}_{int(time.time())}.{ext}"
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(code)
+    print(f"✅ Code saved as {filename}")
+
+    # Open in VS Code if installed, otherwise Notepad
+    if os.path.exists("C:\\Users\\Public\\Desktop\\Visual Studio Code.lnk") or \
+       os.path.exists("C:\\Program Files\\Microsoft VS Code\\Code.exe"):
+        subprocess.run(f'code {filename}', shell=True)
+        speak(f"Code saved and opened in VS Code.")
+    else:
+        os.system(f"notepad {filename}")
+        speak(f"Code saved and opened in Notepad.")
 
 # --- Execute Intent ---
 def execute_intent(intent_json):
@@ -101,6 +136,7 @@ def execute_intent(intent_json):
 
     if intent == "open_app":
         open_app(params.get("app"))
+
     elif intent == "close_app":
         app = params.get("app")
         if SYSTEM == "windows" and app:
@@ -108,26 +144,45 @@ def execute_intent(intent_json):
             speak(f"Closed {app}")
         else:
             speak("Close app not supported on this OS yet.")
+
     elif intent == "screenshot":
         fname = f"screenshot_{int(time.time())}.png"
         pyautogui.screenshot(fname)
         speak("Screenshot taken.")
+
     elif intent == "volume_up":
         for _ in range(5):
             pyautogui.press("volumeup")
         speak("Volume increased.")
+
     elif intent == "volume_down":
         for _ in range(5):
             pyautogui.press("volumedown")
         speak("Volume decreased.")
+
     elif intent == "type":
-        pyautogui.write(params.get("text", ""))
-        speak("Typed it.")
+        text = params.get("text", "")
+        pyautogui.write(text)
+        speak("Typed your text.")
+
     elif intent == "run_command":
         cmd = params.get("cmd")
         if cmd:
             subprocess.run(cmd, shell=True)
             speak(f"Running command {cmd}")
+
+    elif intent == "write_code":  # 🆕 Now fully featured
+        description = params.get("description", "")
+        if not description:
+            speak("Please tell me what code to write.")
+            return
+        speak(f"Generating code for {description}")
+        code = generate_code(description)
+        if code:
+            save_code_to_file(code, description)
+        else:
+            speak("Sorry, I couldn't generate the code right now.")
+
     else:
         speak("I didn't understand that intent.")
 
@@ -136,23 +191,27 @@ def listen_once():
     with mic as source:
         r.adjust_for_ambient_noise(source, duration=0.5)
         print("🎙️ Listening...")
-        audio = r.listen(source, phrase_time_limit=6)
+        audio = r.listen(source, phrase_time_limit=8)
         text = r.recognize_google(audio)
         print("Heard:", text)
         return text
 
 # --- Main Loop ---
 if __name__ == "__main__":
-    speak("Voice control is ready.")
+    speak("Voice coding assistant ready.")
     while True:
         try:
             text = listen_once()
-            if "goodbye" in text.lower():
+            if not text:
+                continue
+            if "goodbye" in text.lower() or "exit" in text.lower():
                 speak("Goodbye.")
                 break
+
             intent_json = parse_intent_locally(text)
             print("Intent:", intent_json)
             execute_intent(intent_json)
+
         except KeyboardInterrupt:
             speak("Goodbye.")
             break
